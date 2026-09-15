@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Assignment 2 - VPC + EC2 via CloudFormation. Bootstraps the instance to
+  create a 'react' user, install Nginx + Node.js, clone a sample React app,
+  build it, and serve it through Nginx.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 KeyPair to enable SSH access
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues: [t2.micro, t2.small, t3.micro, t3.small]
+
+  RepoURL:
+    Type: String
+    Default: https://github.com/reactjs/react-tutorial.git
+    Description: Git URL of the sample React app to clone and host
+
+  SSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: IP range allowed to SSH into the instance (restrict this in real use)
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+
+  # ---------- Networking ----------
+  AppVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: react-app-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: react-app-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref AppVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AppVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: react-app-public-subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AppVPC
+      Tags:
+        - Key: Name
+          Value: react-app-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------- Security ----------
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and HTTP
+      VpcId: !Ref AppVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: react-app-sg
+
+  # ---------- Compute ----------
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref AppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: react-app-server
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/user-data.log) 2>&1
+
+          # 1. System update and base packages
+          dnf update -y
+          dnf install -y git nginx
+
+          # 2. Create dedicated 'react' user
+          useradd -m -s /bin/bash react || true
+
+          # 3. Install Node.js (via NodeSource setup script) system-wide
+          curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+          dnf install -y nodejs
+
+          # 4. Clone the sample React app as the react user
+          su - react -c "git clone ${RepoURL} /home/react/app"
+
+          # 5. Install dependencies and build
+          su - react -c "cd /home/react/app && npm install"
+          su - react -c "cd /home/react/app && npm run build"
+
+          # 6. Deploy build output to Nginx web root
+          rm -rf /usr/share/nginx/html/*
+          cp -r /home/react/app/build/* /usr/share/nginx/html/ 2>/dev/null \
+            || cp -r /home/react/app/dist/* /usr/share/nginx/html/
+
+          # 7. Start and enable services
+          systemctl enable nginx
+          systemctl restart nginx
+
+Outputs:
+  InstancePublicIP:
+    Description: Public IP of the React app server
+    Value: !GetAtt AppInstance.PublicIp
+
+  WebsiteURL:
+    Description: URL to access the hosted React app
+    Value: !Sub http://${AppInstance.PublicIp}
+
+  VPCId:
+    Description: VPC ID
+    Value: !Ref AppVPC
+
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref AppInstance
